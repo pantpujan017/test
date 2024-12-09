@@ -1,0 +1,167 @@
+from picamera2 import Picamera2
+import cv2
+import numpy as np
+import RPi.GPIO as GPIO
+
+# Initialize the Picamera2 instance
+picam2 = Picamera2()
+
+# Configure the camera for preview mode
+config = picam2.create_preview_configuration(main={"format": "RGB888", "size": (640, 480)})
+picam2.configure(config)
+
+# Start the camera
+picam2.start()
+print("Press 'q' to stop the video capture.")
+
+# Adjust the points for the region of interest (ROI)
+roi_points = np.float32([[70, 280], [455, 280], [525, 360], [0, 360]])
+
+# Define the destination points for the bird's eye view
+bird_eye_points = np.float32([[0, 0], [300, 0], [300, 200], [0, 200]])
+
+# Create a perspective transformation matrix
+matrix = cv2.getPerspectiveTransform(roi_points, bird_eye_points)
+
+# Initialize GPIO with the correct pin numbers
+GPIO.setmode(GPIO.BCM)
+GPIO.setup(5, GPIO.OUT)   # Previously 21
+GPIO.setup(6, GPIO.OUT)   # Previously 22
+GPIO.setup(13, GPIO.OUT)  # Previously 23
+GPIO.setup(19, GPIO.OUT)  # Previously 24
+
+def LaneCenter(left_lane, right_lane, frame):
+    if left_lane and right_lane:
+        LeftLanePos = int(np.mean([x[0] for x in left_lane]))
+        RightLanePos = int(np.mean([x[0] for x in right_lane]))
+        
+        laneCenter = (RightLanePos - LeftLanePos) // 2 + LeftLanePos
+        frameCenter = 300 // 2  # Center of the bird's eye view frame width
+        
+        result = frameCenter - laneCenter  # Positive when car is right of center, negative when left of center
+        
+        cv2.line(frame, (laneCenter, 0), (laneCenter, 200), (0, 255, 0), 3)  # Lane center line (green)
+        cv2.line(frame, (frameCenter, 0), (frameCenter, 200), (255, 0, 0), 3)  # Frame center line (blue)
+
+        # Add text to show the result
+        cv2.putText(frame, f"Result: {result} px", (10, 30), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+
+        # Control logic with updated GPIO pins
+        if result == 0:
+            GPIO.output(5, 0)
+            GPIO.output(6, 0)
+            GPIO.output(13, 0)
+            GPIO.output(19, 0)
+            print("Forward")
+        elif 0 < result < 10:
+            GPIO.output(5, 1)
+            GPIO.output(6, 0)
+            GPIO.output(13, 0)
+            GPIO.output(19, 0)
+            print("Right1")
+        elif 10 <= result < 20:
+            GPIO.output(5, 0)
+            GPIO.output(6, 1)
+            GPIO.output(13, 0)
+            GPIO.output(19, 0)
+            print("Right2")
+        elif result >= 20:
+            GPIO.output(5, 1)
+            GPIO.output(6, 1)
+            GPIO.output(13, 0)
+            GPIO.output(19, 0)
+            print("Right3")
+        elif -10 < result < 0:
+            GPIO.output(5, 0)
+            GPIO.output(6, 0)
+            GPIO.output(13, 1)
+            GPIO.output(19, 0)
+            print("Left1")
+        elif -20 <= result <= -10:
+            GPIO.output(5, 1)
+            GPIO.output(6, 0)
+            GPIO.output(13, 1)
+            GPIO.output(19, 0)
+            print("Left2")
+        elif result <= -20:
+            GPIO.output(5, 0)
+            GPIO.output(6, 1)
+            GPIO.output(13, 1)
+            GPIO.output(19, 0)
+            print("Left3")
+
+    return frame
+
+try:
+    while True:
+        # Capture a frame
+        frame = picam2.capture_array()
+
+        # Draw ROI on the original frame
+        cv2.polylines(frame, [roi_points.astype(int)], isClosed=True, color=(0, 0, 255), thickness=2)
+
+        # Get bird's eye view
+        bird_eye_view = cv2.warpPerspective(frame, matrix, (300, 200))
+
+        # Convert to grayscale
+        bird_eye_gray = cv2.cvtColor(bird_eye_view, cv2.COLOR_RGB2GRAY)
+
+        # Apply Canny edge detection
+        bird_eye_edges = cv2.Canny(bird_eye_gray, 50, 150)
+
+        # Merge grayscale and Canny edges in black and white
+        merged_view = cv2.bitwise_or(bird_eye_gray, bird_eye_edges)
+        merged_view = cv2.threshold(merged_view, 210, 255, cv2.THRESH_BINARY)[1]
+
+        # Detect lines using Hough Transform
+        lines = cv2.HoughLinesP(bird_eye_edges, 1, np.pi / 180, threshold=20, minLineLength=20, maxLineGap=30)
+
+        # Create a color version of merged_view to draw colored lines
+        merged_view_color = cv2.cvtColor(merged_view, cv2.COLOR_GRAY2BGR)
+
+        # Define the regions for left and right lanes
+        left_region = (15, 0, 150, 200)
+        right_region = (150, 0, 280, 200)
+
+        # Variables to store lane centers
+        left_lane_centers = []
+        right_lane_centers = []
+
+        # Draw detected lines on the merged view within specific regions
+        if lines is not None:
+            for line in lines:
+                x1, y1, x2, y2 = line[0]
+                if (left_region[0] <= x1 <= left_region[2] and left_region[0] <= x2 <= left_region[2]):
+                    cv2.line(merged_view_color, (x1, y1), (x2, y2), (0, 255, 0), 8)  # Draw the lines in green
+                    center_x = (x1 + x2) // 2
+                    center_y = (y1 + y2) // 2
+                    left_lane_centers.append((center_x, center_y))
+                elif (right_region[0] <= x1 <= right_region[2] and right_region[0] <= x2 <= right_region[2]):
+                    cv2.line(merged_view_color, (x1, y1), (x2, y2), (0, 255, 0), 8)  # Draw the lines in green
+                    center_x = (x1 + x2) // 2
+                    center_y = (y1 + y2) // 2
+                    right_lane_centers.append((center_x, center_y))
+
+        # Call the LaneCenter function to draw center lines and control the GPIO
+        merged_view_color = LaneCenter(left_lane_centers, right_lane_centers, merged_view_color)
+
+        # Display the windows
+        cv2.namedWindow("Region of Interest", cv2.WINDOW_NORMAL)
+        cv2.imshow("Region of Interest", frame)
+
+        cv2.namedWindow("Bird's Eye View", cv2.WINDOW_NORMAL)
+        cv2.imshow("Bird's Eye View", bird_eye_view)
+
+        cv2.namedWindow("Merged Grayscale and Canny", cv2.WINDOW_NORMAL)
+        cv2.imshow("Merged Grayscale and Canny", merged_view_color)
+
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            print("Stopping video capture...")
+            break
+except KeyboardInterrupt:
+    print("Video capture interrupted by user.")
+finally:
+    picam2.stop()
+    GPIO.cleanup()
+    cv2.destroyAllWindows()
